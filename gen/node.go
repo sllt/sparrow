@@ -54,7 +54,7 @@ type Node interface {
 	// - ProcessStateSleep (process has no messages)
 	// - ProcessStateRunning (process is handling its mailbox)
 	// - ProcessStateTerminated (final state of the process lifespan before it will be removed
-	//   removed from the node)
+	//    from the node)
 	// - ProcessStateZombee (process was killed by node being in the running state).
 	ProcessState(pid PID) (ProcessState, error)
 
