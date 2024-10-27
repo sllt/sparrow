@@ -124,8 +124,6 @@ func (a *Actor) ProcessInit(process gen.Process, args ...any) (rr error) {
 }
 
 func (a *Actor) ProcessRun() (rr error) {
-	var message *gen.MailboxMessage
-
 	if lib.Recover() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -139,159 +137,142 @@ func (a *Actor) ProcessRun() (rr error) {
 
 	for {
 		if a.State() != gen.ProcessStateRunning {
-			// process was killed by the node.
 			return gen.TerminateReasonKill
 		}
 
-		if message != nil {
-			gen.ReleaseMailboxMessage(message)
-			message = nil
-		}
-
-		for {
-			// check queues
-			msg, ok := a.mailbox.Urgent.Pop()
-			if ok {
-				// got new urgent message. handle it
-				message = msg.(*gen.MailboxMessage)
-				break
-			}
-
-			msg, ok = a.mailbox.System.Pop()
-			if ok {
-				// got new system message. handle it
-				message = msg.(*gen.MailboxMessage)
-				break
-			}
-
-			msg, ok = a.mailbox.Main.Pop()
-			if ok {
-				// got new regular message. handle it
-				message = msg.(*gen.MailboxMessage)
-				break
-			}
-
-			msg, ok = a.mailbox.Log.Pop()
-			if ok {
-				if reason := a.behavior.HandleLog(msg.(gen.MessageLog)); reason != nil {
-					return reason
-				}
-				continue
-			}
-
-			// no messages in the mailbox
+		message := a.getNextMessage()
+		if message == nil {
 			return nil
 		}
 
-	retry:
-		switch message.Type {
-		case gen.MailboxMessageTypeRegular:
-			var reason error
-
-			if a.split {
-				switch target := message.Target.(type) {
-				case gen.Atom:
-					reason = a.behavior.HandleMessageName(target, message.From, message.Message)
-				case gen.Alias:
-					reason = a.behavior.HandleMessageAlias(target, message.From, message.Message)
-				default:
-					reason = a.behavior.HandleMessage(message.From, message.Message)
-				}
-			} else {
-				reason = a.behavior.HandleMessage(message.From, message.Message)
-			}
-
-			if reason != nil {
-				return reason
-			}
-
-		case gen.MailboxMessageTypeRequest:
-			var reason error
-			var result any
-
-			if a.split {
-				switch target := message.Target.(type) {
-				case gen.Atom:
-					result, reason = a.behavior.HandleCallName(target, message.From, message.Ref, message.Message)
-				case gen.Alias:
-					result, reason = a.behavior.HandleCallAlias(target, message.From, message.Ref, message.Message)
-				default:
-					result, reason = a.behavior.HandleCall(message.From, message.Ref, message.Message)
-				}
-			} else {
-				result, reason = a.behavior.HandleCall(message.From, message.Ref, message.Message)
-			}
-
-			if reason != nil {
-				// if reason is "normal" and we got response - send it before termination
-				if reason == gen.TerminateReasonNormal && result != nil {
-					a.SendResponse(message.From, message.Ref, result)
-				}
-				return reason
-			}
-
-			if result == nil {
-				// async handling of sync request. response could be sent
-				// later, even by the other process
-				continue
-			}
-
-			a.SendResponse(message.From, message.Ref, result)
-
-		case gen.MailboxMessageTypeEvent:
-			if reason := a.behavior.HandleEvent(message.Message.(gen.MessageEvent)); reason != nil {
-				return reason
-			}
-
-		case gen.MailboxMessageTypeExit:
-			switch exit := message.Message.(type) {
-			case gen.MessageExitPID:
-				// trap exit signal if it wasn't send by parent
-				// and TrapExit == true
-				if a.trap && message.From != a.Parent() {
-					message.Type = gen.MailboxMessageTypeRegular
-					goto retry
-				}
-				return fmt.Errorf("%s: %w", exit.PID, exit.Reason)
-
-			case gen.MessageExitProcessID:
-				if a.trap {
-					message.Type = gen.MailboxMessageTypeRegular
-					goto retry
-				}
-				return fmt.Errorf("%s: %w", exit.ProcessID, exit.Reason)
-
-			case gen.MessageExitAlias:
-				if a.trap {
-					message.Type = gen.MailboxMessageTypeRegular
-					goto retry
-				}
-				return fmt.Errorf("%s: %w", exit.Alias, exit.Reason)
-
-			case gen.MessageExitEvent:
-				if a.trap {
-					message.Type = gen.MailboxMessageTypeRegular
-					goto retry
-				}
-				return fmt.Errorf("%s: %w", exit.Event, exit.Reason)
-
-			case gen.MessageExitNode:
-				if a.trap {
-					message.Type = gen.MailboxMessageTypeRegular
-					goto retry
-				}
-				return fmt.Errorf("%s: %w", exit.Name, gen.ErrNoConnection)
-
-			default:
-				panic(fmt.Sprintf("unknown exit message: %#v", exit))
-			}
-
-		case gen.MailboxMessageTypeInspect:
-			result := a.behavior.HandleInspect(message.From, message.Message.([]string)...)
-			a.SendResponse(message.From, message.Ref, result)
+		if err := a.handleMessage(message); err != nil {
+			gen.ReleaseMailboxMessage(message)
+			return err
 		}
 
+		gen.ReleaseMailboxMessage(message)
 	}
+}
+
+func (a *Actor) getNextMessage() *gen.MailboxMessage {
+	for {
+		if msg, ok := a.mailbox.Urgent.Pop(); ok {
+			return msg.(*gen.MailboxMessage)
+		}
+		if msg, ok := a.mailbox.System.Pop(); ok {
+			return msg.(*gen.MailboxMessage)
+		}
+		if msg, ok := a.mailbox.Main.Pop(); ok {
+			return msg.(*gen.MailboxMessage)
+		}
+		if msg, ok := a.mailbox.Log.Pop(); ok {
+			if reason := a.behavior.HandleLog(msg.(gen.MessageLog)); reason != nil {
+				return nil
+			}
+			continue
+		}
+		return nil
+	}
+}
+
+func (a *Actor) handleMessage(message *gen.MailboxMessage) error {
+	switch message.Type {
+	case gen.MailboxMessageTypeRegular:
+		return a.handleRegularMessage(message)
+	case gen.MailboxMessageTypeRequest:
+		return a.handleRequestMessage(message)
+	case gen.MailboxMessageTypeEvent:
+		return a.behavior.HandleEvent(message.Message.(gen.MessageEvent))
+	case gen.MailboxMessageTypeExit:
+		return a.handleExitMessage(message)
+	case gen.MailboxMessageTypeInspect:
+		a.handleInspectMessage(message)
+		return nil
+	default:
+		return fmt.Errorf("unknown message type: %v", message.Type)
+	}
+}
+
+func (a *Actor) handleRegularMessage(message *gen.MailboxMessage) error {
+	if a.split {
+		switch target := message.Target.(type) {
+		case gen.Atom:
+			return a.behavior.HandleMessageName(target, message.From, message.Message)
+		case gen.Alias:
+			return a.behavior.HandleMessageAlias(target, message.From, message.Message)
+		default:
+			return a.behavior.HandleMessage(message.From, message.Message)
+		}
+	}
+	return a.behavior.HandleMessage(message.From, message.Message)
+}
+
+func (a *Actor) handleRequestMessage(message *gen.MailboxMessage) error {
+	var result any
+	var err error
+
+	if a.split {
+		switch target := message.Target.(type) {
+		case gen.Atom:
+			result, err = a.behavior.HandleCallName(target, message.From, message.Ref, message.Message)
+		case gen.Alias:
+			result, err = a.behavior.HandleCallAlias(target, message.From, message.Ref, message.Message)
+		default:
+			result, err = a.behavior.HandleCall(message.From, message.Ref, message.Message)
+		}
+	} else {
+		result, err = a.behavior.HandleCall(message.From, message.Ref, message.Message)
+	}
+
+	if err != nil {
+		if err == gen.TerminateReasonNormal && result != nil {
+			a.SendResponse(message.From, message.Ref, result)
+		}
+		return err
+	}
+
+	if result != nil {
+		a.SendResponse(message.From, message.Ref, result)
+	}
+
+	return nil
+}
+
+func (a *Actor) handleExitMessage(message *gen.MailboxMessage) error {
+	switch exit := message.Message.(type) {
+	case gen.MessageExitPID:
+		if a.trap && message.From != a.Parent() {
+			return a.handleRegularMessage(message)
+		}
+		return fmt.Errorf("%s: %w", exit.PID, exit.Reason)
+	case gen.MessageExitProcessID:
+		if a.trap {
+			return a.handleRegularMessage(message)
+		}
+		return fmt.Errorf("%s: %w", exit.ProcessID, exit.Reason)
+	case gen.MessageExitAlias:
+		if a.trap {
+			return a.handleRegularMessage(message)
+		}
+		return fmt.Errorf("%s: %w", exit.Alias, exit.Reason)
+	case gen.MessageExitEvent:
+		if a.trap {
+			return a.handleRegularMessage(message)
+		}
+		return fmt.Errorf("%s: %w", exit.Event, exit.Reason)
+	case gen.MessageExitNode:
+		if a.trap {
+			return a.handleRegularMessage(message)
+		}
+		return fmt.Errorf("%s: %w", exit.Name, gen.ErrNoConnection)
+	default:
+		return fmt.Errorf("unknown exit message: %#v", exit)
+	}
+}
+
+func (a *Actor) handleInspectMessage(message *gen.MailboxMessage) {
+	result := a.behavior.HandleInspect(message.From, message.Message.([]string)...)
+	a.SendResponse(message.From, message.Ref, result)
 }
 func (a *Actor) ProcessTerminate(reason error) {
 	a.behavior.Terminate(reason)
