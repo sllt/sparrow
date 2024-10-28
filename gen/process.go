@@ -51,10 +51,10 @@ const (
 )
 
 var (
-	TerminateReasonNormal   error = errors.New("normal")
-	TerminateReasonKill     error = errors.New("kill")
-	TerminateReasonPanic    error = errors.New("panic")
-	TerminateReasonShutdown error = errors.New("shutdown")
+	TerminateReasonNormal   = errors.New("normal")
+	TerminateReasonKill     = errors.New("kill")
+	TerminateReasonPanic    = errors.New("panic")
+	TerminateReasonShutdown = errors.New("shutdown")
 )
 
 // Process
@@ -81,7 +81,7 @@ type Process interface {
 	// doesn't cause terminating this process.
 	Spawn(factory ProcessFactory, options ProcessOptions, args ...any) (PID, error)
 
-	// Spawn creates a child process with associated name.
+	// SpawnRegister creates a child process with associated name.
 	SpawnRegister(register Atom, factory ProcessFactory, options ProcessOptions, args ...any) (PID, error)
 
 	// SpawnMeta creates a meta process. Returned alias is associated with this process and other
